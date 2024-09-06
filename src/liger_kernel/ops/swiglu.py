@@ -107,7 +107,10 @@ def swiglu_backward(a, b, dc):
 class LigerSiLUMulFunction(torch.autograd.Function):
     @staticmethod
     @ensure_contiguous
-    def forward(ctx, a, b):
+    def forward(ctx, a, b=None):
+        if b is None:
+            ctx.b_is_none = True
+            return LigerSiLUMulFunctionMergedInput.forward(ctx, a)
         a, b, c = swiglu_forward(a, b)
         ctx.save_for_backward(a, b)
         return c
@@ -115,6 +118,101 @@ class LigerSiLUMulFunction(torch.autograd.Function):
     @staticmethod
     @ensure_contiguous
     def backward(ctx, dc):
+        if hasattr(ctx, "b_is_none") and ctx.b_is_none:
+            return LigerSiLUMulFunctionMergedInput.backward(ctx, dc), None
         a, b = ctx.saved_tensors
         a, b = swiglu_backward(a, b, dc)
         return a, b
+
+@triton.jit
+def _swiglu_forward_kernel_merged_input(
+    input_ptr, output_ptr, input_b_offset: tl.constexpr, n_cols: tl.constexpr, BLOCK_SIZE: tl.constexpr
+):
+    # locate start index
+    pid = tl.program_id(0)
+    input_a_ptr = input_ptr + (pid * n_cols * 2)
+    input_b_ptr = input_ptr + (pid * n_cols * 2) + input_b_offset
+    output_ptr += pid * n_cols
+
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    mask = col_offsets < n_cols
+
+    # sigmoid requires type float32
+    input_a_row = tl.load(input_a_ptr + col_offsets, mask=mask, other=0).to(tl.float32)
+    input_b_row = tl.load(input_b_ptr + col_offsets, mask=mask, other=0)
+    output_row = silu(input_a_row) * input_b_row
+    tl.store(output_ptr + col_offsets, output_row, mask=mask)
+
+
+@triton.jit
+def _swiglu_backward_kernel_merged_input(
+    d_output_ptr, input_ptr, input_b_offset: tl.constexpr, n_cols: tl.constexpr, BLOCK_SIZE: tl.constexpr
+):
+    # locate start index
+    pid = tl.program_id(0)
+    d_output_ptr += pid * n_cols
+    input_a_ptr = input_ptr + (pid * n_cols * 2)
+    input_b_ptr = input_ptr + (pid * n_cols * 2) + input_b_offset
+
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    mask = col_offsets < n_cols
+
+    d_output_row = tl.load(d_output_ptr + col_offsets, mask=mask, other=0)
+    # sigmoid requires type float32
+    input_a_row = tl.load(input_a_ptr + col_offsets, mask=mask, other=0).to(tl.float32)
+    input_b_row = tl.load(input_b_ptr + col_offsets, mask=mask, other=0)
+
+    # recomputation to save memory
+    sig_a = tl.sigmoid(input_a_row)
+    silu_a = input_a_row * sig_a
+    d_input_b_row = d_output_row * silu_a
+    d_input_a_row = d_output_row * (silu_a * (1 - sig_a) + sig_a) * input_b_row
+
+    tl.store(input_a_ptr + col_offsets, d_input_a_row, mask=mask)
+    tl.store(input_b_ptr + col_offsets, d_input_b_row, mask=mask)
+
+class LigerSiLUMulFunctionMergedInput(torch.autograd.Function):
+    @staticmethod
+    @ensure_contiguous
+    def forward(ctx, input):
+        ori_shape = input.shape
+        assert len(ori_shape) in [2, 3]
+        input = input.view(-1, ori_shape[-1])
+        n_rows = input.shape[0]
+        n_cols = input.shape[-1]//2
+        output = torch.empty((n_rows, n_cols), dtype=input.dtype, device=input.device, requires_grad=True)
+
+        BLOCK_SIZE, num_warps = calculate_settings(n_cols)
+
+        _swiglu_forward_kernel_merged_input[(n_rows,)](
+            input,
+            output,
+            input_b_offset=n_cols,
+            n_cols=n_cols,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=num_warps,
+        )
+
+        ctx.save_for_backward(input)
+        return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
+
+    @staticmethod
+    @ensure_contiguous
+    def backward(ctx, d_output):
+
+        n_rows = d_output.shape[0]
+        n_cols = d_output.shape[-1]
+        d_output = d_output.view(-1, n_cols)
+        input = ctx.saved_tensors[0]
+
+        BLOCK_SIZE, num_warps = calculate_settings(n_cols*2)
+
+        _swiglu_backward_kernel_merged_input[(n_rows,)](
+            d_output,
+            input,
+            input_b_offset=n_cols,
+            n_cols=n_cols,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=num_warps,
+        )
+        return input if len(input.shape) == 3 else input.view(input.shape[0], 1, input.shape[-1])
