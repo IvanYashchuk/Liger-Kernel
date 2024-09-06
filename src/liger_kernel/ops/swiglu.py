@@ -176,6 +176,7 @@ class LigerSiLUMulFunctionMergedInput(torch.autograd.Function):
     @ensure_contiguous
     def forward(ctx, input):
         ori_shape = input.shape
+        ctx.ori_shape = ori_shape
         assert len(ori_shape) in [2, 3]
         input = input.view(-1, ori_shape[-1])
         n_rows = input.shape[0]
@@ -215,4 +216,4 @@ class LigerSiLUMulFunctionMergedInput(torch.autograd.Function):
             BLOCK_SIZE=BLOCK_SIZE,
             num_warps=num_warps,
         )
-        return input if len(input.shape) == 3 else input.view(input.shape[0], 1, input.shape[-1])
+        return input if len(input.shape) == 3 else input.view(*ctx.ori_shape)
